@@ -1,0 +1,12 @@
+assets/external/
+.web
+.states
+*.py[cod]
+*.db
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
