@@ -1,152 +1,298 @@
+import os
+import re
+import sys
+import tempfile
+import subprocess
 import reflex as rx
-from groq import Groq
-import meshlib.mrmeshpy as mr
+from openrouter import OpenRouter
 
-# Initialize Groq (Ensure export GROQ_API_KEY="your_key" is set in terminal)
-client = Groq()
+client = OpenRouter(
+    api_key=os.getenv("HACKCLUB_API_KEY", ""),
+    server_url="https://ai.hackclub.com/proxy/v1",
+    timeout_ms=15000,
+)
 
-class State(rx.State):
+MESHLIB_SYSTEM_PROMPT = """You are an automated Python code generator specializing in the MeshLib library (`meshlib.mrmeshpy`).
+
+### ABSOLUTE OUTPUT RULES:
+1. Return ONLY executable Python code inside a single ```python code block.
+2. DO NOT include explanations, reasoning, thought process, or extra text.
+3. Always assign the final output object to a variable named `final_mesh`.
+4. DO NOT import meshlib inside the block or call mesh saving/export commands; assume standard dependencies and helpers are injected globally.
+
+### AVAILABLE PRIMITIVES & HELPERS:
+- Vectors & Matrices:
+  - `Vector3f(x, y, z)`
+  - `Matrix3f.rotation(Vector3f(axis_x, axis_y, axis_z), angle_rad)`
+- Transforms:
+  - `AffineXf3f.translation(Vector3f(x, y, z))`
+  - `AffineXf3f.rotation(Vector3f(axis_x, axis_y, axis_z), angle_rad)`
+  - Transform mesh: `mesh.transform(xf)`
+- Primitives:
+  - `makeCube(Vector3f(size_x, size_y, size_z))`
+  - `makeCylinder(radius, length, resolution)`
+  - `makeUVSphere(radius, resolution_u, resolution_v)`
+  - `makeCone(radius, height, resolution)`
+  - `makeTorus(primaryRadius, secondaryRadius)`
+- Boolean CSG Helpers:
+  - `booleanSub(meshA, meshB)` -> Returns Difference (meshA minus meshB)
+  - `booleanOr(meshA, meshB)` -> Returns Union
+  - `booleanAnd(meshA, meshB)` -> Returns Intersection
+
+### GEOMETRY RULES:
+- Every boolean operation (`booleanOr`, `booleanSub`, `booleanAnd`) MUST take two valid Mesh objects.
+- NEVER pass `None` or unassigned variables into boolean helper functions.
+- Always initialize `final_mesh` as a valid primitive before performing boolean unions or subtractions.
+"""
+
+class CADState(rx.State):
     user_prompt: str = ""
-    ai_generated_markdown: str = "### Click 'Generate Architecture' to begin..."
-    raw_code_block: str = ""  
-    execution_status: str = ""
+    ai_generated_markdown: str = ""
+    raw_code_block: str = ""
+    execution_status: str = "Ready to generate."
     is_loading: bool = False
     is_compiling: bool = False
 
-    def update_prompt(self, val: str):
-        self.user_prompt = val
+    def set_user_prompt(self, value: str):
+        self.user_prompt = value
 
     def generate_design_code(self):
-        self.is_loading = True
-        self.execution_status = ""
-        yield
-        system_instructions = (
-            "You are an expert computational geometry engineer writing Python code for MeshLib. "
-            "CRITICAL RULES:\n"
-            "1. Instantiate vectors using `Vector3f(x, y, z)`.\n"
-            "2. To make a box or cube, use makeCube with either a positional or keyword size parameter:\n"
-            "   final_mesh = makeCube(Vector3f(30.0, 30.0, 30.0))\n"
-            "3. To make a cylinder, use makeCylinder with these parameters: radius (float), length (float), resolution (int):\n"
-            "   final_mesh = makeCylinder(10.0, 20.0, 64)\n"
-            "4. To make a sphere, use makeSphere with parameters: radius (float), resolution (int):\n"
-            "   final_mesh = makeSphere(10.0, 64)\n"
-            "5. Always ensure the final output shape object is explicitly assigned to a variable named `final_mesh`.\n"
-            "6. Do not include any mesh saving, exporting, or loading commands in your script.\n"
-            "7. Output ONLY the raw Python block inside standard ```python blocks."
-        )
-        try:
-            completion = client.chat.completions.create(
-                model="qwen/qwen3.6-27b",
-                messages=[
-                    {"role": "system", "content": system_instructions},
-                    {"role": "user", "content": f"Write a MeshLib script for: {self.user_prompt}"}
-                ]
-            )
-            response = completion.choices[0].message.content
-            self.ai_generated_markdown = response
-            
-            if "```python" in response:
-                clean_block = response.split("```python")[1].split("```")[0]
-            elif "```" in response:
-                clean_block = response.split("```")[1].split("```")[0]
-            else:
-                clean_block = response
+        if not self.user_prompt.strip():
+            self.execution_status = "⚠️ Please enter a prompt first."
+            return
 
-            cleaned_lines = []
-            for line in clean_block.splitlines():
-                stripped = line.strip()
-                stripped = stripped.replace("`", "")
-                if "meshlib" in stripped.lower() or not stripped:
-                    continue
-                cleaned_lines.append(stripped)
-            self.raw_code_block = "\n".join(cleaned_lines).strip()
-        
+        self.is_loading = True
+        self.execution_status = "Requesting model code generation..."
+        self.ai_generated_markdown = "Generating CAD code..."
+        yield
+
+        try:
+            response = client.chat.send(
+                model="google/gemini-2.5-flash",
+                messages=[
+                    {"role": "system", "content": MESHLIB_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": f"Generate a simple MeshLib python script for: {self.user_prompt}",
+                    },
+                ],
+                stream=False,
+            )
+
+            raw_text = response.choices[0].message.content or ""
+            self.ai_generated_markdown = raw_text
+
+            match = re.search(r"```python\s*(.*?)\s*```", raw_text, re.DOTALL)
+            if match:
+                self.raw_code_block = match.group(1).strip()
+            else:
+                self.raw_code_block = raw_text.replace("```", "").strip()
+
+            self.execution_status = "Code generated! Click 'Compile & Download STL'."
+
         except Exception as e:
-            self.ai_generated_markdown = f"API Connection Error: {str(e)}"
+            self.execution_status = f"Request Failed: {str(e)}"
+            self.ai_generated_markdown = f"### Request Error\n`{str(e)}`"
+
         self.is_loading = False
 
     def compile_stl_locally(self):
-        """Executes the AI-generated code directly in memory on the local server"""
         if not self.raw_code_block:
-            self.execution_status = "❌ No code available to compile!"
+            self.execution_status = "No code available to compile!"
             return
+
         self.is_compiling = True
+        self.execution_status = "⏳ Compiling STL geometry in subprocess..."
         yield
+
+        output_stl_file = "output_design.stl"
+
+        runner_script = f"""
+import math
+import meshlib.mrmeshpy as mr
+
+Vector3f = mr.Vector3f
+Matrix3f = mr.Matrix3f
+AffineXf3f = mr.AffineXf3f
+makeCube = mr.makeCube
+makeCylinder = mr.makeCylinder
+makeTorus = mr.makeTorus
+makeCone = mr.makeCone
+makeSphere = mr.makeSphere
+SphereParams = mr.SphereParams
+
+def rotate_transform(axis, angle):
+    return mr.AffineXf3f.linear(mr.Matrix3f.rotation(axis, angle))
+
+mr.AffineXf3f.rotation = staticmethod(rotate_transform)
+AffineXf3f.rotation = staticmethod(rotate_transform)
+
+if hasattr(mr, 'makeUVSphere'):
+    makeUVSphere = mr.makeUVSphere
+else:
+    def makeUVSphere(radius=1.0, res_u=64, res_v=64):
+        return mr.makeUVSphere(radius, res_u, res_v)
+
+def booleanOr(meshA, meshB):
+    if meshA is None: return meshB
+    if meshB is None: return meshA
+    res = mr.boolean(meshA, meshB, mr.BooleanOperation.Union)
+    out_mesh = res.mesh if hasattr(res, 'mesh') else res
+    return out_mesh if (out_mesh and hasattr(out_mesh, 'topology')) else meshA
+
+def booleanSub(meshA, meshB):
+    if meshA is None: return None
+    if meshB is None: return meshA
+    res = mr.boolean(meshA, meshB, mr.BooleanOperation.DifferenceAB)
+    out_mesh = res.mesh if hasattr(res, 'mesh') else res
+    return out_mesh if (out_mesh and hasattr(out_mesh, 'topology')) else meshA
+
+def booleanAnd(meshA, meshB):
+    if meshA is None or meshB is None: return None
+    res = mr.boolean(meshA, meshB, mr.BooleanOperation.Intersection)
+    out_mesh = res.mesh if hasattr(res, 'mesh') else res
+    return out_mesh if (out_mesh and hasattr(out_mesh, 'topology')) else meshA
+
+{self.raw_code_block}
+
+if 'final_mesh' in locals() and final_mesh is not None:
+    if hasattr(final_mesh, 'mesh'):
+        final_mesh = final_mesh.mesh
+        
+    mr.saveMesh(final_mesh, "{output_stl_file}")
+    print("SUCCESS")
+else:
+    print("ERROR: Variable 'final_mesh' was None or not assigned a valid Mesh object.")
+"""
+
         try:
-            local_vars = {
-                'mr': mr,
-                'mm': mr,
-                'Vector3f': mr.Vector3f,
-                'Box3f': mr.Box3f,
-                'makeCube': mr.makeCube,
-                'makeCylinder': mr.makeCylinder,
-                'makeSphere': mr.makeSphere
-            }
-            exec(self.raw_code_block, globals(), local_vars)
-            
-            if 'final_mesh' in local_vars:
-                final_mesh = local_vars['final_mesh']
-                # FIX: Pass the file path string directly to the exporter
-                mr.saveMesh(final_mesh, "output_design.stl")
-                self.execution_status = "✅ Success! 'output_design.stl' generated in your root folder."
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+                f.write(runner_script)
+                temp_script_path = f.name
+
+            result = subprocess.run(
+                [sys.executable, temp_script_path],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+
+            if os.path.exists(temp_script_path):
+                os.remove(temp_script_path)
+
+            if result.returncode == 0 and os.path.exists(output_stl_file):
+                self.execution_status = "✅ Success! Starting STL file download..."
+                self.is_compiling = False
+
+                with open(output_stl_file, "rb") as f:
+                    file_bytes = f.read()
+
+                os.remove(output_stl_file)
+
+                return rx.download(
+                    data=file_bytes,
+                    filename="generated_model.stl",
+                )
             else:
-                self.execution_status = "❌ Error: The AI code failed to define a 'final_mesh' object."
+                error_msg = result.stderr.strip() or result.stdout.strip()
+                self.execution_status = f"Execution Error:\n{error_msg}"
+
+        except subprocess.TimeoutExpired:
+            self.execution_status = "⏱️ Error: Execution timed out (20s limit)."
         except Exception as e:
-            self.execution_status = f"❌ Runtime Error:\n{str(e)}"
+            self.execution_status = f"System Error:\n{str(e)}"
+
         self.is_compiling = False
 
 def index() -> rx.Component:
-    return rx.center(
+    return rx.container(
         rx.vstack(
-            rx.heading("Autonomous Mesh AI Core", size="7", margin_bottom="1em"),
-            rx.text_area(
-                placeholder="Describe the physical component layout (e.g., A 40mm cube with a 5mm hole)...",
-                on_change=State.update_prompt,
+            rx.vstack(
+                rx.badge("3D Generator", color_scheme="indigo", variant="soft", radius="full"),
+                rx.heading("Assistocrat", size="8", weight="bold"),
+                rx.text(
+                    "Make very simple shapes with AI even though it's worse than if you do it yourself. Built with love by TheGeekachu",
+                    color="gray",
+                    size="3",
+                    align="center",
+                ),
+                align_items="center",
+                spacing="2",
                 width="100%",
-                height="100px",
+                padding_y="4",
             ),
-            rx.hstack(
-                rx.button(
-                    "Generate Architecture", 
-                    on_click=State.generate_design_code, 
-                    loading=State.is_loading,
+            rx.card(
+                rx.vstack(
+                    rx.text("Prompt Design", weight="bold", size="3"),
+                    rx.input(
+                        placeholder="e.g. A 40mm cube",
+                        value=CADState.user_prompt,
+                        on_change=CADState.set_user_prompt,
+                        width="100%",
+                        size="3",
+                        variant="surface",
+                    ),
+                    rx.vstack(
+                        rx.button(
+                            "1. Generate Code",
+                            on_click=CADState.generate_design_code,
+                            loading=CADState.is_loading,
+                            color_scheme="indigo",
+                            variant="solid",
+                            size="3",
+                            width="100%",
+                        ),
+                        rx.button(
+                            "2. Compile & Download STL",
+                            on_click=CADState.compile_stl_locally,
+                            loading=CADState.is_compiling,
+                            color_scheme="green",
+                            variant="solid",
+                            size="3",
+                            width="100%",
+                        ),
+                        width="100%",
+                        spacing="3",
+                    ),
+                    spacing="4",
+                    width="100%",
                 ),
-                rx.button(
-                    "Compile & Generate STL", 
-                    on_click=State.compile_stl_locally, 
-                    loading=State.is_compiling,
-                    color_scheme="green",
-                ),
-                margin_top="10px",
-                spacing="3"
+                size="4",
+                width="100%",
+            ),
+            rx.callout(
+                CADState.execution_status,
+                icon="info",
+                width="100%",
+                size="2",
             ),
             rx.cond(
-                State.execution_status != "",
-                rx.box(
-                    rx.text(State.execution_status, font_family="monospace", white_space="pre-wrap"),
-                    padding="1em",
-                    margin_top="10px",
-                    background_color="var(--gray-3)",
-                    border_radius="6px",
-                    width="100%"
-                )
+                CADState.ai_generated_markdown != "",
+                rx.card(
+                    rx.vstack(
+                        rx.hstack(
+                            rx.text("Generated Python Payload", weight="bold", size="3"),
+                            rx.badge("Python", color_scheme="blue", variant="soft"),
+                            justify="between",
+                            width="100%",
+                        ),
+                        rx.markdown(
+                            CADState.ai_generated_markdown,
+                            width="100%",
+                        ),
+                        spacing="3",
+                        width="100%",
+                    ),
+                    size="3",
+                    width="100%",
+                ),
             ),
-            rx.divider(margin_y="1.5em"),
-            rx.box(
-                rx.markdown(State.ai_generated_markdown),
-                padding="1.5em",
-                border_radius="8px",
-                background_color="var(--gray-2)",
-                border="1px solid var(--gray-5)",
-                width="100%",
-                min_height="300px",
-                overflow_x="auto"
-            ),
-            width="600px",
-            align_items="stretch"
+            spacing="5",
+            padding_y="8",
+            width="100%",
         ),
-        padding_y="4em",
+        max_width="720px",
     )
 
 app = rx.App()
-app.add_page(index)
+app.add_page(index, title="Assistocrat - 3D CAD Generator")

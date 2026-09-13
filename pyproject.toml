@@ -7,5 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "groq>=1.5.0",
     "meshlib>=3.1.3.297",
+    "openrouter>=1.1.139",
     "reflex>=0.9.6.post1",
+    "reflex-hosting-cli>=0.1.72",
 ]
